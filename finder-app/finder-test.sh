@@ -33,7 +33,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # create $WRITEDIR if not assignment1
-assignment=`cat ../conf/assignment.txt`
+assignment=`cat conf/assignment.txt`
 
 if [ $assignment != 'assignment1' ]
 then
@@ -54,7 +54,7 @@ fi
 #make clean
 
 # Compile the writer application using native compilation
-#make CROSS_COMPILE=aarch64-none-linux-gnu- 
+#make CROSS_COMPILE=aarch64-none-linux-gnu-
 
 for i in $( seq 1 $NUMFILES)
 do
