@@ -19,7 +19,7 @@ OBJ = $(SRC:.c=.o)
 
 # Targets
 writer: $(OBJ)
-        $(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-        rm -f writer $(OBJ) 
+	rm -f writer $(OBJ)
