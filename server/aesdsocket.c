@@ -1,184 +1,265 @@
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <netdb.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
 #include <string.h>
-#include <syslog.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-void *get_in_addr(struct sockaddr *sa) {
-    if (sa->sa_family == AF_INET) {
-        return &(((struct sockaddr_in*)sa)->sin_addr);
-    }
+#include <syslog.h>
+#include <unistd.h>
 
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+// global vars are ugly
+int server_fd;
+int accepted_fd;
+int file_fd;
+int should_exit = 0;
+int processing_packet = 0;
+const char *file_path = "/tmp/aesdsocket";
+
+struct options {
+  in_port_t port;
+  int daemonize;
+};
+
+void printUsage(char *argv[]) {
+  fprintf(stderr, "Usage: %s -d -p <port>\n", argv[0]);
+  exit(EXIT_FAILURE);
 }
-volatile sig_atomic_t keep_running = 1;
 
-void handle_signal(int signal) {
-    keep_running = 0;
-    if (remove("/var/tmp/aesdsocketdata") != 0) {
-        perror("Error removing output file");
+void parseArgs(int argc, char *argv[], struct options *options) {
+  int opt = -1;
+  while ((opt = getopt(argc, argv, "dp:")) != -1) {
+    switch (opt) {
+    case 'p':
+      options->port = (in_port_t)strtol(optarg, NULL, 10);
+      break;
+    case 'd':
+      options->daemonize = 1;
+      break;
+    case '?':
+    case 'h':
+      fprintf(stderr, "Unknow option or missing argument: %c %c\n", opt, optopt);
+      exit(EXIT_FAILURE);
+    default:
+      printUsage(argv);
     }
-    exit(0);
+  }
 }
-void handle_client(int client_fd) {
-    FILE *fp = fopen("/var/tmp/aesdsocketdata", "a+");
-    if (fp == NULL) {
-        perror("fopen");
-        close(client_fd);
-        return;
+
+void cleanUpAndExit(int status) {
+  syslog(LOG_INFO, "Exiting with status %d", status);
+
+  if (accepted_fd > 0) {
+    close(server_fd);
+    accepted_fd = -1;
+  }
+
+  if (server_fd > 0) {
+    close(server_fd);
+    server_fd = -1;
+  }
+
+  if (file_fd > 0) {
+    close(file_fd);
+    remove(file_path);
+    file_fd = -1;
+  }
+
+  closelog();
+  exit(status);
+}
+
+void signal_handler(int signal) {
+  syslog(LOG_INFO, "Caught signal, exiting");
+  should_exit = 1;
+  if (!processing_packet) {
+    cleanUpAndExit(EXIT_SUCCESS);
+  }
+}
+
+int write_buffer(int fd, char *buffer, int buffer_len) {
+  int bytes_written = 0;
+  while (bytes_written < buffer_len) {
+    int ret = write(fd, buffer + bytes_written, buffer_len - bytes_written);
+    if (ret < 0) {
+      return 0;
     }
-    syslog(LOG_DEBUG,"Opened file");
+    bytes_written += ret;
+  }
+  return 1;
+}
 
-    char buffer[1024];
-    int bytes_received;
-    char *newline_pos;
-    int bytes_sent;
-    while ((bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        syslog(LOG_DEBUG,"received %s",buffer);
+void handle_client_connection(int accepted_fd, struct sockaddr_in client_addr) {
+  char ip_address[16];
+  char in_buffer[1024];
+  int in_buffer_len = sizeof(in_buffer) - 1;
 
+  char out_buffer[1024];
+  memset(in_buffer, 0, sizeof(in_buffer));
+  memset(out_buffer, 0, sizeof(out_buffer));
 
-        if ((newline_pos = strchr(buffer, '\n')) != NULL) {
-            *newline_pos = '\0';
-            fprintf(fp, "%s\n", buffer); 
-            break;
-            
-        } else {
-            fprintf(fp, "%s", buffer);
+  inet_ntop(AF_INET, &client_addr.sin_addr, ip_address, sizeof(ip_address));
+  syslog(LOG_INFO, "Accepted connection from %s", ip_address);
+
+  lseek(file_fd, 0, SEEK_END);
+
+  ssize_t in_bytes_read = -1;
+  while (!should_exit && (in_bytes_read = read(accepted_fd, in_buffer, in_buffer_len)) > 0) {
+    processing_packet = 1;
+    in_buffer[in_bytes_read] = '\0';
+
+    char *newline_char = in_buffer;
+    char *prev_newline_char = in_buffer;
+
+    while ((newline_char = strchr(prev_newline_char, '\n')) != NULL) {
+      if (!write_buffer(file_fd, prev_newline_char, newline_char - prev_newline_char + 1)) {
+        syslog(LOG_ERR, "Failed to write to file");
+        cleanUpAndExit(EXIT_FAILURE);
+      }
+
+      lseek(file_fd, 0, SEEK_SET);
+      ssize_t file_bytes_read = 0;
+      while ((file_bytes_read = read(file_fd, out_buffer, sizeof(out_buffer))) > 0) {
+        if (!write_buffer(accepted_fd, out_buffer, file_bytes_read)) {
+          syslog(LOG_ERR, "Failed to write to socket");
+          return;
         }
-    }
-    syslog(LOG_DEBUG,"Wrote to file");
-
-    if (bytes_received == -1) {
-        perror("recv");
-    }
-    rewind(fp);
-    while ((bytes_received = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
-        bytes_sent = send(client_fd, buffer, bytes_received, 0);
-        if (bytes_sent == -1) {
-            perror("send");
-            break;
-        }
-    }
-    syslog(LOG_DEBUG,"Sent data");
-
-    fclose(fp);
-    close(client_fd);
-}
-void daemonize() {
-    pid_t pid;
-
-    pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        exit(EXIT_FAILURE);
+      }
+      lseek(file_fd, 0, SEEK_END);
+      prev_newline_char = newline_char + 1;
     }
 
-    if (pid > 0) {
-        exit(EXIT_SUCCESS); // Parent exits
+    if (!write_buffer(file_fd, prev_newline_char, in_bytes_read - (prev_newline_char - in_buffer))) {
+      syslog(LOG_ERR, "Failed to write to file");
+      cleanUpAndExit(EXIT_FAILURE);
     }
 
-    if (setsid() < 0) {
-        perror("setsid");
-        exit(EXIT_FAILURE);
-    }
+    processing_packet = 0;
+  }
 
-    pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        exit(EXIT_FAILURE);
-    }
-
-    if (pid > 0) {
-        exit(EXIT_SUCCESS); // Parent exits
-    }
-
-    umask(0); // Clear file mode creation mask
-
-    if (chdir("/") < 0) { // Change working directory to root
-        perror("chdir");
-        exit(EXIT_FAILURE);
-    }
-
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-}
-int main(int argc, char **argv){
-    
-    struct sigaction sa;
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-
-    if (sigaction(SIGINT, &sa, NULL) == -1 || sigaction(SIGTERM, &sa, NULL) == -1) {
-        perror("sigaction");
-        exit(EXIT_FAILURE);
-    }
-    openlog(NULL,0,LOG_USER);
-    struct addrinfo *result = NULL;
-    struct addrinfo hints;
-    struct sockaddr their_addr;
-    int sockfd,new_fd;
-    socklen_t sin_size;
-    int yes=1;
-    char s[INET6_ADDRSTRLEN];
-    memset(&hints,0,sizeof hints);
-    hints.ai_family=AF_UNSPEC;
-    hints.ai_socktype=SOCK_STREAM;
-    hints.ai_flags=AI_PASSIVE;
-    if (getaddrinfo(NULL,"9000",&hints,&result)!=0){
-        return -1;
-    }
-    if((sockfd=socket(result->ai_family,result->ai_socktype,result->ai_protocol))==-1){
-        return -1;
-    }
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-            perror("setsockopt");
-            return -1;
-        }
-    if (bind(sockfd, result->ai_addr, result->ai_addrlen) == -1) {
-        close(sockfd);
-        perror("server: bind");
-    }
-    freeaddrinfo(result);
-    int daemon_mode = 0;
-
-    // Check for -d flag
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        daemon_mode = 1;
-    }
-
-    if (daemon_mode) {
-        daemonize();
-    }
-    if (listen(sockfd, 10) == -1) {
-        perror("listen");
-        return -1;
-    }
-    while(keep_running) {  // main accept() loop
-        sin_size = sizeof their_addr;
-        new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-        if (new_fd == -1) {
-            perror("accept");
-            continue;
-        }
-
-        inet_ntop(their_addr.sa_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-        syslog(LOG_DEBUG,"Accepted connection from %s\n",s);
-
-        handle_client(new_fd);
-        syslog(LOG_DEBUG,"Closed connection from %s\n",s);
-
-    }
-    close(sockfd);
-    return 0;
+  if (in_bytes_read < 0) {
+    syslog(LOG_ERR, "Failed to read from socket");
+  }
+  syslog(LOG_INFO, "Connection closed from %s", ip_address);
 }
 
+void deamonize(char *base_name) {
 
+  pid_t pid = fork();
+
+  if (pid < 0) {
+    syslog(LOG_ERR, "Failed to fork");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  if (pid > 0) {
+    exit(EXIT_SUCCESS);
+  }
+
+  if (setsid() < 0) {
+    syslog(LOG_ERR, "Failed to create new session");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  pid = fork();
+  if (pid < 0) {
+    syslog(LOG_ERR, "Failed to fork");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  if (pid > 0) {
+    exit(EXIT_SUCCESS);
+  }
+
+  umask(0);
+  chdir("/");
+
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
+
+  closelog();
+  openlog(base_name, LOG_PID, LOG_DAEMON);
+  setlogmask(LOG_UPTO(LOG_INFO));
+}
+
+int main(int argc, char *argv[]) {
+
+  struct options options = {
+      .port = 9000,
+  };
+  parseArgs(argc, argv, &options);
+
+  char *base_name = basename(argv[0]);
+  fprintf(stdout, "Starting %s\n", base_name);
+  openlog(base_name, LOG_PID, LOG_USER);
+  setlogmask(LOG_UPTO(LOG_INFO));
+
+  file_fd = open(file_path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+  if (file_fd < 0) {
+    syslog(LOG_ERR, "Failed to open file %s", file_path);
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) {
+    syslog(LOG_ERR, "Failed to create socket");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  int ret;
+  int option_value = 1;
+  ret = setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &option_value, sizeof(option_value));
+  if (ret < 0) {
+    syslog(LOG_ERR, "Failed to set socket option");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  struct sockaddr_in server_addr;
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = INADDR_ANY;
+  server_addr.sin_port = htons(options.port);
+
+  ret = bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  if (ret < 0) {
+    syslog(LOG_ERR, "Failed to bind socket");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  ret = listen(server_fd, 10);
+  if (ret < 0) {
+    syslog(LOG_ERR, "Failed to listen on socket");
+    cleanUpAndExit(EXIT_FAILURE);
+  }
+
+  if (options.daemonize) {
+    deamonize(base_name);
+  }
+
+  signal(SIGINT, signal_handler);
+  signal(SIGTERM, signal_handler);
+
+  while (!should_exit) {
+
+    fprintf(stdout, "Waiting for connection on port %d\n", options.port);
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    accepted_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+    if (accepted_fd < 0) {
+      syslog(LOG_ERR, "Failed to accept connection");
+      continue;
+    }
+
+    handle_client_connection(accepted_fd, client_addr);
+
+    close(accepted_fd);
+    accepted_fd = -1;
+  }
+
+  cleanUpAndExit(EXIT_SUCCESS);
+}
